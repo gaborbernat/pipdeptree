@@ -15,7 +15,7 @@ use crate::options::Options;
 use crate::process::{ProcessRequest, ProcessRunner};
 
 const INTERPRETER_INFO: &str = r#"{
-    "paths": sys.path,
+    "paths": _paths,
     "executable": sys.executable,
     "prefix": sys.prefix,
     "base_prefix": sys.base_prefix,
@@ -164,17 +164,35 @@ impl MarkerValues {
 
 impl InterpreterInfo {
     fn current(py: Python<'_>) -> PyResult<Self> {
-        let globals = PyDict::new(py);
-        for module in ["os", "platform", "site", "sys"] {
-            globals.set_item(module, PyModule::import(py, module)?)?;
-        }
-        let expression =
-            CString::new(INTERPRETER_INFO).expect("interpreter query has no null bytes");
-        let value = py.eval(&expression, Some(&globals), None)?;
-        let encoded: String = PyModule::import(py, "json")?
-            .call_method1("dumps", (value,))?
-            .extract()?;
-        serde_json::from_str(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
+        let sys = PyModule::import(py, "sys")?;
+        let os = PyModule::import(py, "os")?;
+        let sys_path = sys.getattr("path")?;
+        // A caller may narrow sys.path to just the discovery target (e.g. the current directory)
+        // before the engine runs, which hides stdlib modules not imported at startup, such as
+        // platform. Expose the interpreter's own stdlib for the duration of the query while
+        // reporting the caller's unaltered path, so the query resolves without changing discovery.
+        let reported_paths = sys_path.call_method0("copy")?;
+        let stdlib = os
+            .getattr("path")?
+            .call_method1("dirname", (os.getattr("__file__")?,))?;
+        sys_path.call_method1("insert", (0, &stdlib))?;
+        let info = (|| {
+            let globals = PyDict::new(py);
+            globals.set_item("os", &os)?;
+            globals.set_item("sys", &sys)?;
+            globals.set_item("platform", PyModule::import(py, "platform")?)?;
+            globals.set_item("site", PyModule::import(py, "site")?)?;
+            globals.set_item("_paths", &reported_paths)?;
+            let expression =
+                CString::new(INTERPRETER_INFO).expect("interpreter query has no null bytes");
+            let value = py.eval(&expression, Some(&globals), None)?;
+            let encoded: String = PyModule::import(py, "json")?
+                .call_method1("dumps", (value,))?
+                .extract()?;
+            serde_json::from_str(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
+        })();
+        sys_path.call_method1("remove", (&stdlib,))?;
+        info
     }
 
     fn query(processes: &dyn ProcessRunner, interpreter: &Path) -> Result<Self, Error> {
